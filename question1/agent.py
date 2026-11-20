@@ -2,14 +2,40 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import all_articles_blob
+from shared.kb import article_ids, load_article
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_STOPWORDS = {
+    "the", "a", "an", "is", "it", "to", "for", "of", "in", "on", "and", "or",
+    "my", "i", "we", "you", "this", "that", "with", "be", "are", "was", "have",
+}
+
+
+def _tokenize(text: str) -> set[str]:
+    return {t for t in _TOKEN_RE.findall(text.lower()) if len(t) > 2 and t not in _STOPWORDS}
+
+
+def retrieve_top_articles(query_text: str, max_k: int = 2, margin: int = 3) -> str:
+    """Adaptive lexical retriever: sends top-1 when confidence margin is clear, else top-2."""
+    query_tokens = _tokenize(query_text)
+    scored: list[tuple[int, str, str]] = []
+    for aid in article_ids():
+        body = load_article(aid)
+        id_overlap = len(query_tokens & _tokenize(aid.replace("-", " "))) * 3
+        body_overlap = len(query_tokens & _tokenize(body))
+        scored.append((id_overlap + body_overlap, aid, body.strip()))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+
+    if len(scored) >= 2 and scored[0][0] >= scored[1][0] + margin:
+        selected = scored[:1]
+    else:
+        selected = scored[:max_k]
+    return "\n\n".join(f"[{aid}]\n{body}" for _, aid, body in selected)
 
 @dataclass
 class TicketResolution:
@@ -32,23 +58,15 @@ def parse_resolution(text: str) -> TicketResolution:
     )
 
 
-_FEW_SHOT = """
-Example ticket resolutions (format to copy):
-
-1. Unopened headphones, day 10 → {"action":"REFUND","kb_article":"returns-within-30-days"}
-2. Ebook, license shown → {"action":"SEND_ARTICLE","kb_article":"digital-license-no-refund"}
-3. Cracked custom mug → {"action":"ESCALATE_TIER2","kb_article":"custom-items-no-replace"}
-4. Cracked stock mug, day 2 → {"action":"REPLACE","kb_article":"damage-replacement-7-days"}
-"""
+_SYSTEM_PROMPT = (
+    "You are ShopAssist, a Tier-1 e-commerce support agent. "
+    "Choose action (REFUND, REPLACE, SEND_ARTICLE, ESCALATE_TIER2), cite the matching kb_article, "
+    "and write a brief customer_reply. Return ONLY valid JSON."
+)
 
 
 class SupportCopilot:
-    """
-    ShopAssist Tier-1 copilot (baseline).
-
-    Given a support ticket + order snapshot, choose an action, cite the help-center
-    article, and draft the customer reply.
-    """
+    """ShopAssist Tier-1 copilot (cost-optimized single call with local retrieval)."""
 
     def __init__(self, session: CostSession | None = None):
         self.session = session or CostSession()
@@ -58,29 +76,18 @@ class SupportCopilot:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
         thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
+        snapshot = json.dumps(order, separators=(",", ":"))
+        policies = retrieve_top_articles(f"{thread} {snapshot}", max_k=2)
 
-        system = "\n\n".join(
-            [
-                f"Run id {uuid.uuid4()}",
-                "You are ShopAssist, the Tier-1 customer support copilot.",
-                _FEW_SHOT,
-                "HELP CENTER:",
-                all_articles_blob(),
-                (
-                    "Instructions: Think step by step. Write full reasoning, quote any article "
-                    "you rely on, then output JSON with action, kb_article, customer_reply."
-                ),
-            ]
-        )
         user = "\n\n".join(
             [
                 f"TICKET_ID: {ticket_id}",
+                f"POLICIES:\n{policies}",
                 f"THREAD:\n{thread}",
                 f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
             ]
         )
-        return [ChatMessage("system", system), ChatMessage("user", user)]
+        return [ChatMessage("system", _SYSTEM_PROMPT), ChatMessage("user", user)]
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         messages = self.build_messages(ticket_id)
